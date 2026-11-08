@@ -1,124 +1,139 @@
-from flask import Flask, request, jsonify
-import os, re, json, subprocess, sys
+from flask import Flask, request, jsonify, send_file
+import os, re, json, subprocess, sys, tempfile, shutil, time
 app = Flask(__name__)
 
-HTML = open(os.path.join(os.path.dirname(__file__), "index.html"), encoding="utf-8").read() if os.path.exists(os.path.join(os.path.dirname(__file__), "index.html")) else None
+# --- Cargar HTML ---
+BASE = os.path.dirname(__file__)
+def load_html():
+    p = os.path.join(BASE, "index.html")
+    if os.path.exists(p):
+        return open(p, encoding="utf-8").read()
+    return HTML_FALLBACK
 
 @app.route("/")
 def home():
-    if HTML:
-        return HTML
-    # Fallback si no hay index.html - usa el HTML embebido
-    return HTML_FALLBACK
+    return load_html()
 
 @app.route("/health")
 def health():
     return "OK"
 
+def get_video_info(url):
+    """Duracion + titulo real con yt-dlp"""
+    title = "Video detectado"
+    duration = None
+    duration_str = "auto"
+    try:
+        out = subprocess.run(["yt-dlp", "-j", "--no-playlist", url], capture_output=True, text=True, timeout=60)
+        if out.stdout.strip():
+            data = json.loads(out.stdout.splitlines()[0])
+            title = data.get("title") or title
+            duration = data.get("duration")
+            if duration:
+                m = int(duration)//60
+                s = int(duration)%60
+                duration_str = f"{m}:{s:02d} ({int(duration)}s)"
+    except Exception as e:
+        print("yt-dlp info error", e)
+    # fallback get-duration
+    if not duration:
+        try:
+            out = subprocess.run(["yt-dlp", "--get-duration", "--get-title", url], capture_output=True, text=True, timeout=30)
+            lines=[l.strip() for l in out.stdout.splitlines() if l.strip()]
+            if len(lines)>=2:
+                title=lines[0]; duration_str=lines[-1]
+        except: pass
+    return title, duration, duration_str
+
+def get_transcript(url):
+    """Intenta bajar subtitulos automaticos para que Gemini entienda el video"""
+    try:
+        tmp = tempfile.mkdtemp()
+        subprocess.run(["yt-dlp", "--write-auto-subs", "--sub-langs", "en.*,es.*", "--skip-download", "-o", os.path.join(tmp,"sub.%(ext)s"), url], capture_output=True, timeout=60)
+        txt=""
+        for f in os.listdir(tmp):
+            if f.endswith(".vtt"):
+                t=open(os.path.join(tmp,f), encoding="utf-8", errors="ignore").read()
+                t=re.sub(r"<[^>]+>","",t)
+                txt+=t[:12000]
+                break
+        shutil.rmtree(tmp, ignore_errors=True)
+        return txt[:12000]
+    except Exception as e:
+        print("transcript error", e)
+        return ""
+
+def gemini_clips(title, duration, transcript, mode, url):
+    """Llama a Gemini con la API key de Render"""
+    api_key = os.environ.get("GEMINI_API_KEY","").strip()
+    if not api_key:
+        return None, "Falta GEMINI_API_KEY en Render > Environment"
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        # duracion objetivo
+        if mode=="largo":
+            dur_instr="Clips de 30 a 60 segundos. Solo momentos que duren mas de 30 segundos y que funcionen como Short completo."
+            n="6"
+        else:
+            dur_instr="Clips de 8 a 15 segundos. Empiezan directo en la accion, sin intro."
+            n="Sin limite: si el video es largo, devuelve 20-30 clips, uno por cada momento viral. Si es corto, devuelve todos los que haya."
+        prompt = f"""Eres un clipper viral estilo OpusClip. Analiza este video y devuelve SOLO JSON.
+
+Video: {title}
+URL: {url}
+Duracion total en segundos: {duration}
+Modo: {mode} - {dur_instr}
+Transcripcion / subtitulos (puede estar incompleta):
+{transcript[:8000]}
+
+REGLAS:
+- Sin titulo quemado, sin subtitulo, sin MEME, sin narracion. Audio original.
+- Vertical 9:16, calidad 2160x3840, sin blur, sin barras.
+- Cada clip: start (segundo inicio), end (segundo fin), title (titulo corto para publicar, MAYUSCULAS, sin acentos, sin nombres famosos con ENTITY, max 4 palabras).
+- {n}
+- Devuelve SOLO este JSON: {{"clips": [{{"start": 0, "end": 12, "title": "TITULO CORTO"}}]}}
+"""
+        resp = client.models.generate_content(model="gemini-3-flash-preview", contents=prompt)
+        txt = resp.text or ""
+        # extraer JSON
+        m = re.search(r"\{.*\}", txt, re.S)
+        if not m:
+            return None, f"Gemini no devolvio JSON: {txt[:300]}"
+        data = json.loads(m.group(0))
+        clips=[]
+        for i,c in enumerate(data.get("clips",[])[:30]):
+            try:
+                s=int(float(c.get("start",0))); e=int(float(c.get("end", s+12)))
+                if e<=s: e=s+12
+                if mode=="largo":
+                    e=min(e, s+60)
+                else:
+                    e=min(e, s+15)
+                clips.append({"n":i+1,"title":str(c.get("title","MOMENTO VIRAL")).upper()[:40],"start":s,"end":e,"dur":f"0:{e-s:02d}" if e-s<60 else f"{(e-s)//60}:{(e-s)%60:02d}"})
+            except: continue
+        if not clips:
+            return None, "Gemini devolvio 0 clips"
+        return clips, None
+    except Exception as e:
+        return None, f"Error Gemini: {str(e)[:400]}"
+
 @app.route("/api/generate", methods=["POST"])
 def generate():
     data = request.get_json(force=True, silent=True) or {}
-    url = data.get("url","")
+    url = (data.get("url") or "").strip()
     mode = data.get("mode","rapido")
-    # Intentar obtener duracion real con yt-dlp si esta disponible
-    duration = "auto"
-    title = "Video detectado"
-    try:
-        out = subprocess.run(["yt-dlp","--get-duration","--get-title", url], capture_output=True, text=True, timeout=30)
-        lines = [l.strip() for l in out.stdout.splitlines() if l.strip()]
-        if len(lines)>=2:
-            title = lines[0]
-            duration = lines[-1]
-        elif lines:
-            title = lines[0]
-    except Exception as e:
-        pass
-    # Clips demo estructurados como los reales - Gemini en PC genera los reales
-    base = [
-        ("ERLING HAALAND FUTBOL","0:12"),("ALYSA LIU PATINAJE","0:11"),("HARDIK PANDYA BEISBOL","0:14"),
-        ("GORDON RAMSAY COCINA","0:10"),("LEBRON JAMES BALONCESTO","0:13"),("CAM CASTRO A OAKLAND","0:09"),
-        ("PAT MURPHY CONTRA YANKEES","0:12"),("MANOS GIGANTE","0:08"),("UN COCHE PERDIDO","0:15"),
-        ("MI PRIMER HR 411","0:11"),("NADIE PUEDE CONMIGO","0:12"),("MOMENTO VIRAL FINAL","0:14"),
-    ]
-    # Si modo largo, duraciones 30-60s
-    if mode=="largo":
-        base = [(t,"0:42") for t,_ in base[:6]]
-    clips = [{"n":i+1,"title":t,"dur":d} for i,(t,d) in enumerate(base)]
-    return jsonify({"title":title,"duration":duration,"mode":mode,"clips":clips,"note":"En Render Free mostramos la lista y el formato. Para corte MP4 real en 2160x3840 usa tu PC con Docker + FFmpeg, que ya tienes."})
+    if not url:
+        return jsonify({"error":"Pega tu link primero"}), 400
+    title, duration, duration_str = get_video_info(url)
+    transcript = get_transcript(url)
+    clips, err = gemini_clips(title, duration, transcript, mode, url)
+    if err or not clips:
+        # Fallback honesto: NO demo falso, devolvemos error real para que lo veas
+        return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":[],"note":err or "No se pudieron generar clips","is_demo":False}), 200
+    return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":clips,"note":f"Analizado con Gemini • {len(clips)} momentos reales de este video • Sin titulo quemado, sin subtitulo, sin MEME, audio original, 9:16","is_demo":False})
 
-HTML_FALLBACK = """<!DOCTYPE html>
-<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EL DE LA J - Clipper Web</title>
-<style>
-*{box-sizing:border-box}body{margin:0;background:#0a0a0a;color:#fff;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-.top{background:#000;padding:14px 18px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10;border-bottom:1px solid #222}
-.logo{font-weight:900;letter-spacing:.5px}.logo span{color:#ffe600}.pill{border:1px solid #333;padding:6px 12px;border-radius:999px;font-size:12px;color:#ccc}
-.hero{padding:38px 18px 10px;text-align:center}.hero h1{font-size:52px;line-height:.9;margin:0;font-weight:900}.hero h1 i{color:#ffe600;font-style:normal}
-.hero p{color:#aaa;max-width:640px;margin:14px auto}.badge{display:inline-block;background:#ffe600;color:#000;font-weight:800;padding:6px 12px;border-radius:999px;font-size:12px;margin:4px}
-.card{background:#151515;border:1px solid #262626;border-radius:18px;max-width:760px;margin:18px auto;padding:20px}
-.card h2{margin:0 0 6px}.card p{color:#aaa;font-size:14px;margin:0 0 14px}
-input[type=text]{width:100%;padding:14px;border-radius:12px;border:1px solid #333;background:#0f0f0f;color:#fff;font-size:15px;outline:none}
-.modes{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0}
-.mode{border:2px solid #2a2a2a;border-radius:14px;padding:12px;cursor:pointer;background:#0f0f0f}.mode.active{border-color:#ffe600;background:#1a1a00}
-.mode b{display:block}.mode small{color:#aaa}
-button.main{width:100%;background:#ffe600;color:#000;border:0;padding:15px;border-radius:12px;font-weight:900;font-size:16px;cursor:pointer}
-button.main:disabled{opacity:.6}.hint{font-size:12px;color:#888;text-align:center;margin-top:10px}
-.status{background:#111;border:1px solid #222;border-radius:12px;padding:12px;margin-top:12px;display:none;font-size:14px}
-.grid{max-width:1100px;margin:10px auto 40px;padding:0 14px}.grid h3{font-size:22px}
-.clips{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
-@media(max-width:900px){.clips{grid-template-columns:repeat(3,1fr)}.hero h1{font-size:38px}.modes{grid-template-columns:1fr}}
-.clip{background:#161616;border:1px solid #262626;border-radius:14px;overflow:hidden}
-.thumb{aspect-ratio:9/16;background:linear-gradient(160deg,#222,#000);display:flex;align-items:center;justify-content:center;position:relative}
-.thumb span{font-size:34px}.play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}.play i{background:#ffe600;color:#000;width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-style:normal;font-weight:900}
-.info{padding:8px}.info b{font-size:12px;display:block;line-height:1.2;min-height:28px}.meta{font-size:11px;color:#aaa;display:flex;justify-content:space-between;margin-top:6px}
-.dl{display:block;text-align:center;background:#fff;color:#000;text-decoration:none;padding:7px;border-radius:8px;font-size:12px;font-weight:800;margin-top:8px}
-.note{max-width:1100px;margin:0 auto;padding:0 14px 30px;color:#888;font-size:13px;line-height:1.6}
-a{color:#ffe600}
-</style></head><body>
-<div class="top"><div class="logo">EL DE LA <span>J</span> • JFlow Produciendo</div><div class="pill">@jflowproduciendo • 1080p+ • SIN MEME</div></div>
-<div class="hero"><div><span class="badge">SIN TÍTULO QUEMADO</span><span class="badge">SIN SUBTÍTULO</span><span class="badge">AUDIO ORIGINAL</span><span class="badge">VERTICAL 9:16</span></div>
-<h1>EL DE LA <i>J</i><br>CLIPPER WEB</h1><p>Pega tu link de YouTube o TikTok. Detectamos la duración automáticamente y te damos todos los momentos virales, sin límite de clips. Calidad superior a 1080p, hasta 2160x3840.</p></div>
-<div class="card"><h2>Pega tu link</h2><p>Funciona con YouTube y TikTok. No tienes que escribir la duración a mano.</p>
-<input id="url" type="text" placeholder="https://www.youtube.com/watch?v=...">
-<div class="modes">
-<div class="mode active" id="m1" onclick="setMode('rapido')"><b>⚡ Clips Rápidos 8-15s</b><small>El clásico viral. Empieza directo en la acción.</small></div>
-<div class="mode" id="m2" onclick="setMode('largo')"><b>🎬 Video Largo → Short 30-60s</b><small>Para momentos &gt;30s. Lo convierte en Short completo.</small></div>
-</div>
-<button class="main" id="btn" onclick="generar()">✂️ GENERAR CLIPS VIRALES</button>
-<div class="hint">Detecta duración automáticamente • Sin límite: si el video es de 20 min, te da 20-30 clips por momentos</div>
-<div class="status" id="status"></div></div>
-<div class="grid"><h3 id="tituloClips">CLIPS VIRALES</h3><div class="clips" id="clips"></div></div>
-<div class="note"><b>Sobre Mí:</b> EL DE LA J - JFlow Produciendo. Clips limpios, sin texto quemado, audio original, vertical lleno 9:16. <br>Si un clip se ve en baja calidad es porque YouTube solo entregó ese video en 360p/720p. Sube el archivo en buena calidad para 4K real.<br>Prueba con: https://www.youtube.com/watch?v=_c2e1NcI3Sc</div>
-<script>
-let mode='rapido';
-function setMode(m){mode=m;document.getElementById('m1').classList.toggle('active',m=='rapido');document.getElementById('m2').classList.toggle('active',m=='largo')}
-function demoClips(url){
- const base=[["ERLING HAALAND FUTBOL","0:12"],["ALYSA LIU PATINAJE","0:11"],["HARDIK PANDYA BEISBOL","0:14"],["GORDON RAMSAY COCINA","0:10"],["LEBRON JAMES BALONCESTO","0:13"],["CAM CASTRO A OAKLAND","0:09"],["PAT MURPHY CONTRA YANKEES","0:12"],["MANOS GIGANTE","0:08"],["UN COCHE PERDIDO","0:15"],["MI PRIMER HR 411","0:11"],["NADIE PUEDE CONMIGO","0:12"],["MOMENTO VIRAL FINAL","0:14"]];
- return base.map((b,i)=>({n:i+1,title:b[0],dur:b[1]}));
-}
-async function generar(){
- const url=document.getElementById('url').value.trim();
- const st=document.getElementById('status'); const btn=document.getElementById('btn');
- if(!url){alert('Pega tu link primero');return}
- btn.disabled=true; btn.textContent='Analizando con Gemini...';
- st.style.display='block'; st.innerHTML='⏳ Descargando info... Detectando duración automáticamente... <br>Si Render no tiene FFmpeg, te mostramos la lista y los clips demo para que veas el formato.';
- try{
-   const r=await fetch('/api/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,mode})});
-   const d=await r.json();
-   st.innerHTML=`✅ <b>${d.title||'Video detectado'}</b> • Duración: <b>${d.duration||'auto'}</b> • Modo: ${mode} • ${d.clips.length} clips encontrados. <br><span style="color:#aaa">${d.note||''}</span>`;
-   render(d.clips);
- }catch(e){ const clips=demoClips(url); st.innerHTML='✅ Modo demo (Render Free sin FFmpeg) • 12 clips detectados'; render(clips); }
- btn.disabled=false; btn.textContent='✂️ GENERAR CLIPS VIRALES';
-}
-function render(clips){
- document.getElementById('tituloClips').textContent=`CLIPS VIRALES • ${clips.length} CLIPS`;
- document.getElementById('clips').innerHTML=clips.map(c=>`
-  <div class="clip"><div class="thumb"><span>🔥</span><div class="play"><i>▶</i></div></div>
-  <div class="info"><b>CLIP ${c.n} • ${c.title}</b><div class="meta"><span>${c.dur}</span><span>9:16</span></div><a class="dl" href="#" onclick="alert('En Render Free el corte real necesita FFmpeg. En tu PC con Docker sí descarga el MP4 real.');return false">⬇ Descargar</a></div></div>`).join('');
-}
-render(demoClips(''));
-</script></body></html>
-"""
+HTML_FALLBACK = open(os.path.join(BASE,"index.html"),encoding="utf-8").read() if os.path.exists(os.path.join(BASE,"index.html")) else "<h1>EL DE LA J</h1><p>Sube index.html</p>"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
