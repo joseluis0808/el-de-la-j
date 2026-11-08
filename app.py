@@ -22,6 +22,8 @@ def get_video_info(url):
     """Duracion + titulo real con yt-dlp"""
     title = "Video detectado"
     duration = None
+    thumbnail = ""
+    video_id = ""
     duration_str = "auto"
     try:
         out = subprocess.run(["yt-dlp", "-j", "--no-playlist", url], capture_output=True, text=True, timeout=60)
@@ -29,6 +31,8 @@ def get_video_info(url):
             data = json.loads(out.stdout.splitlines()[0])
             title = data.get("title") or title
             duration = data.get("duration")
+            thumbnail = data.get("thumbnail") or ""
+            video_id = data.get("id") or ""
             if duration:
                 m = int(duration)//60
                 s = int(duration)%60
@@ -43,7 +47,12 @@ def get_video_info(url):
             if len(lines)>=2:
                 title=lines[0]; duration_str=lines[-1]
         except: pass
-    return title, duration, duration_str
+    if not video_id:
+        m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{6,})", url)
+        video_id = m.group(1) if m else ""
+    if not thumbnail and video_id:
+        thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return title, duration, duration_str, thumbnail, video_id
 
 def get_transcript(url):
     """Intenta bajar subtitulos automaticos para que Gemini entienda el video"""
@@ -125,13 +134,13 @@ def generate():
     mode = data.get("mode","rapido")
     if not url:
         return jsonify({"error":"Pega tu link primero"}), 400
-    title, duration, duration_str = get_video_info(url)
+    title, duration, duration_str, thumbnail, video_id = get_video_info(url)
     transcript = get_transcript(url)
     clips, err = gemini_clips(title, duration, transcript, mode, url)
     if err or not clips:
         # Fallback honesto: NO demo falso, devolvemos error real para que lo veas
-        return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":[],"note":err or "No se pudieron generar clips","is_demo":False}), 200
-    return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":clips,"note":f"Analizado con Gemini • {len(clips)} momentos reales de este video • Sin titulo quemado, sin subtitulo, sin MEME, audio original, 9:16","is_demo":False})
+        return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":[],"note":err or "No se pudieron generar clips","is_demo":False,"thumbnail":thumbnail,"video_id":video_id}), 200
+    return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":clips,"thumbnail":thumbnail,"video_id":video_id,"note":f"Analizado con Gemini • {len(clips)} momentos reales de este video • Sin titulo quemado, sin subtitulo, sin MEME, audio original, 9:16","is_demo":False})
 
 
 def get_ffmpeg():
@@ -165,10 +174,13 @@ def download_clip():
     try:
         # 1. Descargar video en mejor calidad disponible
         out_template = os.path.join(tmp, "full.%(ext)s")
-        dl = subprocess.run(["yt-dlp","-f","bestvideo[height<=1080]+bestaudio/best[height<=1080]/best","--merge-output-format","mp4","-o",out_template, url], capture_output=True, text=True, timeout=300)
+        dl = subprocess.run(["yt-dlp","--extractor-args","youtube:player_client=android,web","-f","bestvideo[height<=1080]+bestaudio/best[height<=1080]/best","--merge-output-format","mp4","-o",out_template, url], capture_output=True, text=True, timeout=300)
         files = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.startswith("full.")]
         if not files:
-            return f"No se pudo descargar el video. yt-dlp: {dl.stdout[-500:]} {dl.stderr[-500:]}", 500
+            dl2 = subprocess.run(["yt-dlp","--extractor-args","youtube:player_client=android","-f","best","-o",out_template, url], capture_output=True, text=True, timeout=300)
+            files = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.startswith("full.")]
+        if not files:
+            return f"No se pudo descargar el video. YouTube bloqueo a Render (Error 403). Prueba con otro video o usa tu PC con Docker. Detalle: {(dl.stderr or dl.stdout)[-600:]}", 500
         src = files[0]
         ffmpeg = get_ffmpeg()
         out = os.path.join(tmp, f"{title}_{start}_{end}.mp4")
@@ -178,11 +190,19 @@ def download_clip():
         cmd = [ffmpeg,"-y","-ss",str(start),"-i",src,"-t",str(end-start),"-vf",vf,"-c:v","libx264","-preset","medium","-crf","16","-c:a","aac","-b:a","192k","-movflags","+faststart", out]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         if not os.path.exists(out) or os.path.getsize(out)<10000:
-            return f"FFmpeg fallo: {r.stderr[-800:]}", 500
+            return f"FFmpeg fallo: {r.stderr[-800:]}. FFmpeg usado: {ffmpeg}", 500
         return send_file(out, as_attachment=True, download_name=f"{title}.mp4", mimetype="video/mp4")
     except Exception as e:
         return f"Error cortando: {str(e)}", 500
 
+
+
+@app.route("/api/thumb")
+def thumb():
+    vid = request.args.get("v","")
+    if not vid:
+        return "Falta v", 400
+    return jsonify({"url": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"})
 
 HTML_FALLBACK = open(os.path.join(BASE,"index.html"),encoding="utf-8").read() if os.path.exists(os.path.join(BASE,"index.html")) else "<h1>EL DE LA J</h1><p>Sube index.html</p>"
 
