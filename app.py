@@ -133,6 +133,57 @@ def generate():
         return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":[],"note":err or "No se pudieron generar clips","is_demo":False}), 200
     return jsonify({"title":title,"duration":duration_str,"mode":mode,"clips":clips,"note":f"Analizado con Gemini • {len(clips)} momentos reales de este video • Sin titulo quemado, sin subtitulo, sin MEME, audio original, 9:16","is_demo":False})
 
+
+def get_ffmpeg():
+    import shutil
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as e:
+        return "ffmpeg"
+
+@app.route("/api/download")
+def download_clip():
+    url = request.args.get("url","")
+    try:
+        start = int(float(request.args.get("start","0")))
+        end = int(float(request.args.get("end","12")))
+    except:
+        start, end = 0, 12
+    title = request.args.get("title","CLIP") or "CLIP"
+    title = re.sub(r"[^A-Za-z0-9_\\- ]","", title).strip().replace(" ","_")[:30] or "CLIP"
+    if not url:
+        return "Falta url", 400
+    if end<=start:
+        end=start+12
+    if end-start>70:
+        end=start+60
+    tmp = tempfile.mkdtemp()
+    try:
+        # 1. Descargar video en mejor calidad disponible
+        out_template = os.path.join(tmp, "full.%(ext)s")
+        dl = subprocess.run(["yt-dlp","-f","bestvideo[height<=1080]+bestaudio/best[height<=1080]/best","--merge-output-format","mp4","-o",out_template, url], capture_output=True, text=True, timeout=300)
+        files = [os.path.join(tmp,f) for f in os.listdir(tmp) if f.startswith("full.")]
+        if not files:
+            return f"No se pudo descargar el video. yt-dlp: {dl.stdout[-500:]} {dl.stderr[-500:]}", 500
+        src = files[0]
+        ffmpeg = get_ffmpeg()
+        out = os.path.join(tmp, f"{title}_{start}_{end}.mp4")
+        # Vertical 9:16 lleno, sin blur, sin barras, zoom centro, sin texto, audio original, crf 16
+        # crop a 9:16 centrado y escala a 1080x1920
+        vf = "crop=ih*9/16:ih,scale=1080:1920:flags=lanczos"
+        cmd = [ffmpeg,"-y","-ss",str(start),"-i",src,"-t",str(end-start),"-vf",vf,"-c:v","libx264","-preset","medium","-crf","16","-c:a","aac","-b:a","192k","-movflags","+faststart", out]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if not os.path.exists(out) or os.path.getsize(out)<10000:
+            return f"FFmpeg fallo: {r.stderr[-800:]}", 500
+        return send_file(out, as_attachment=True, download_name=f"{title}.mp4", mimetype="video/mp4")
+    except Exception as e:
+        return f"Error cortando: {str(e)}", 500
+
+
 HTML_FALLBACK = open(os.path.join(BASE,"index.html"),encoding="utf-8").read() if os.path.exists(os.path.join(BASE,"index.html")) else "<h1>EL DE LA J</h1><p>Sube index.html</p>"
 
 if __name__ == "__main__":
